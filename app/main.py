@@ -2,8 +2,8 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt
 import boto3
-import uuid
 import os
+import uuid
 
 app = FastAPI()
 security = HTTPBearer()
@@ -13,25 +13,28 @@ dynamodb = boto3.resource('dynamodb')
 TABLE_NAME = "SesameSmartHome"
 table = dynamodb.Table(TABLE_NAME)
 
-# ⚠️ In production, fetch JWKS and validate token signature
-def get_user_id(token: HTTPAuthorizationCredentials = Depends(security)) -> str:
+#  WARNING: For prod, use real Auth0 public key to verify signature
+def get_user_id(token: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(token.credentials, options={"verify_signature": False})
         return payload["sub"]
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid JWT token")
 
-# Optional endpoint to bootstrap user profile
+# Init user profile on login
 @app.post("/init")
-def initialize_user(user_id: str = Depends(get_user_id)):
+def init_user(user_id: str = Depends(get_user_id)):
     profile_key = {'pk': user_id, 'sk': 'PROFILE#default'}
-    existing = table.get_item(Key=profile_key)
-    if 'Item' in existing:
-        return {"status": "already_initialized"}
-
-    table.put_item(Item={**profile_key, "created": True})
+    res = table.get_item(Key=profile_key)
+    if 'Item' not in res:
+        table.put_item(Item={
+            'pk': user_id,
+            'sk': 'PROFILE#default',
+            'created': True
+        })
     return {"status": "initialized"}
 
+#  List devices
 @app.get("/devices")
 def get_devices(user_id: str = Depends(get_user_id)):
     response = table.query(
@@ -43,6 +46,7 @@ def get_devices(user_id: str = Depends(get_user_id)):
     )
     return response.get("Items", [])
 
+# Create new device
 @app.post("/devices")
 def create_device(device: dict, user_id: str = Depends(get_user_id)):
     device_id = str(uuid.uuid4())
@@ -55,8 +59,9 @@ def create_device(device: dict, user_id: str = Depends(get_user_id)):
         'state': 'OFF'
     }
     table.put_item(Item=item)
-    return {"status": "created", "deviceId": device_id}
+    return {"status": "ok", "deviceId": device_id}
 
+# Toggle device state
 @app.post("/devices/{device_id}/control")
 def toggle_device(device_id: str, user_id: str = Depends(get_user_id)):
     key = {'pk': user_id, 'sk': f'DEVICE#{device_id}'}
@@ -65,11 +70,13 @@ def toggle_device(device_id: str, user_id: str = Depends(get_user_id)):
         raise HTTPException(status_code=404, detail="Device not found")
 
     device = res['Item']
-    device['state'] = 'OFF' if device['state'] == 'ON' else 'ON'
+    new_state = "ON" if device["state"] == "OFF" else "OFF"
+    device["state"] = new_state
 
     table.put_item(Item=device)
-    return {"status": "toggled", "newState": device['state']}
+    return {"status": "toggled", "newState": new_state}
 
+# Delete device
 @app.delete("/devices/{device_id}")
 def delete_device(device_id: str, user_id: str = Depends(get_user_id)):
     key = {'pk': user_id, 'sk': f'DEVICE#{device_id}'}
