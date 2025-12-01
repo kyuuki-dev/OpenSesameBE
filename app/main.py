@@ -1,112 +1,67 @@
 from fastapi import FastAPI, Depends, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from app.auth import get_token_payload
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt
 import boto3
-import uuid
-from datetime import datetime
 import os
+import uuid
 
 app = FastAPI()
+security = HTTPBearer()
 
-# CORS (adjust frontend domain)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # use your frontend domain here
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# DynamoDB setup
+dynamodb = boto3.resource('dynamodb')
+TABLE_NAME = "SesameSmartHome"
+table = dynamodb.Table(TABLE_NAME)
 
-# DynamoDB
-dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
-table_name = os.environ.get("DYNAMO_TABLE", "SesameSmartHome")
-table = dynamodb.Table(table_name)
-
-# ---- USER ENDPOINT ----
-@app.get("/me")
-def get_or_create_user(payload=Depends(get_token_payload)):
-    user_id = payload["sub"]
-    email = payload.get("email", "unknown")
-
-    # Check if user exists
+# ⚠️ WARNING: For prod, use real Auth0 public key to verify signature
+def get_user_id(token: HTTPAuthorizationCredentials = Depends(security)):
     try:
-        res = table.get_item(Key={"PK": user_id, "SK": "PROFILE"})
-        if "Item" in res:
-            return res["Item"]
-    except:
-        pass
-
-    # Create user profile
-    user = {
-        "PK": user_id,
-        "SK": "PROFILE",
-        "email": email,
-        "createdAt": datetime.utcnow().isoformat(),
-    }
-    table.put_item(Item=user)
-    return user
-
-
-# ---- DEVICES ----
+        payload = jwt.decode(token.credentials, options={"verify_signature": False})
+        return payload["sub"]
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid JWT token")
 
 @app.get("/devices")
-def list_devices(payload=Depends(get_token_payload)):
-    user_id = payload["sub"]
-    res = table.query(
-        KeyConditionExpression="PK = :pk and begins_with(SK, :sk)",
-        ExpressionAttributeValues={":pk": user_id, ":sk": "DEVICE#"}
+def get_devices(user_id: str = Depends(get_user_id)):
+    response = table.query(
+        KeyConditionExpression='pk = :uid AND begins_with(sk, :dev)',
+        ExpressionAttributeValues={
+            ':uid': user_id,
+            ':dev': 'DEVICE#'
+        }
     )
-    return [
-        {
-            "deviceId": item["SK"].split("#")[1],
-            "friendlyName": item["friendlyName"],
-            "deviceType": item["deviceType"],
-            "state": item.get("state", "OFF")
-        } for item in res.get("Items", [])
-    ]
-
+    return response.get("Items", [])
 
 @app.post("/devices")
-def add_device(data: dict, payload=Depends(get_token_payload)):
-    user_id = payload["sub"]
+def create_device(device: dict, user_id: str = Depends(get_user_id)):
     device_id = str(uuid.uuid4())
     item = {
-        "PK": user_id,
-        "SK": f"DEVICE#{device_id}",
-        "deviceId": device_id,
-        "friendlyName": data["friendlyName"],
-        "deviceType": data["deviceType"],
-        "state": "OFF",
-        "createdAt": datetime.utcnow().isoformat()
+        'pk': user_id,
+        'sk': f'DEVICE#{device_id}',
+        'deviceId': device_id,
+        'friendlyName': device['friendlyName'],
+        'deviceType': device['deviceType'],
+        'state': 'OFF'
     }
     table.put_item(Item=item)
     return {"status": "ok", "deviceId": device_id}
 
-
 @app.post("/devices/{device_id}/control")
-def toggle_device(device_id: str, payload=Depends(get_token_payload)):
-    user_id = payload["sub"]
-    key = {"PK": user_id, "SK": f"DEVICE#{device_id}"}
-    item = table.get_item(Key=key).get("Item")
-
-    if not item:
+def toggle_device(device_id: str, user_id: str = Depends(get_user_id)):
+    key = {'pk': user_id, 'sk': f'DEVICE#{device_id}'}
+    res = table.get_item(Key=key)
+    if 'Item' not in res:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    new_state = "OFF" if item.get("state") == "ON" else "ON"
-    item["state"] = new_state
-    table.put_item(Item=item)
-    return {"status": "ok", "newState": new_state}
+    device = res['Item']
+    new_state = "ON" if device["state"] == "OFF" else "OFF"
+    device["state"] = new_state
 
+    table.put_item(Item=device)
+    return {"status": "toggled", "newState": new_state}
 
 @app.delete("/devices/{device_id}")
-def delete_device(device_id: str, payload=Depends(get_token_payload)):
-    user_id = payload["sub"]
-    key = {"PK": user_id, "SK": f"DEVICE#{device_id}"}
+def delete_device(device_id: str, user_id: str = Depends(get_user_id)):
+    key = {'pk': user_id, 'sk': f'DEVICE#{device_id}'}
     table.delete_item(Key=key)
     return {"status": "deleted"}
-
-
-# ---- SCENES (placeholder) ----
-@app.get("/scenes")
-def get_scenes(payload=Depends(get_token_payload)):
-    return [{"id": "scene1", "name": "Sample Scene"}]
